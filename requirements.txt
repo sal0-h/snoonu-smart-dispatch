@@ -1,0 +1,16 @@
+# Snoonu Smart Dispatch - Dependencies
+# =====================================
+# Install with: pip install -r requirements.txt
+
+# Web Dashboard
+streamlit>=1.28.0
+
+# Data Processing
+pandas>=2.0.0
+
+# Map Visualization
+folium>=0.15.0
+streamlit-folium>=0.15.0
+
+# HTTP Requests (OSRM road distance API)
+requests>=2.31.0

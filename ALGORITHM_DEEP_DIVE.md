@@ -361,6 +361,9 @@ marginal_dist = total_distance - existing_dist
 ```python
 def run_sequential(self, drivers, new_orders, current_time):
     """Sequential market-based dispatch with MARGINAL COST bidding."""
+    # Clear TSP cache at start of dispatch cycle (fresh state)
+    _clear_tsp_cache()
+    
     assigned_orders = []
     
     # Build eligible driver list
@@ -446,7 +449,7 @@ Drivers Used: 1 (instead of 2 in Baseline!)
 | **Re-routing** | ✅ Yes - route recalculated on each new order |
 | **Decision Speed** | Fast - per-order bidding |
 | **Optimality** | Good - competitive allocation with marginal costs |
-| **Complexity** | O(n × m × k!) where k=orders per driver |
+| **Complexity** | O(n × m × k²·2^k) where k=stops per driver (Held-Karp TSP) |
 
 ---
 
@@ -479,15 +482,16 @@ GRAPH-CUT BUNDLE GENERATION:
 ### Implementation: Bundle Generation (`dispatch.py`)
 
 ```python
-def generate_spatial_bundles(orders, max_bundle_size=2):
+def generate_spatial_bundles(orders, max_bundle_size=2, prebuilt_distances=None):
     """Generate bundles using recursive graph-cut spatial clustering."""
     if not orders:
         return []
     
-    # Build distance matrix once
-    distances = _build_distance_matrix(orders)
+    # Use prebuilt distance matrix if provided, otherwise build one
+    distances = prebuilt_distances or _build_distance_matrix(orders)
     
     bundles = []
+    seen_bundle_ids = set()  # O(1) duplicate detection using frozensets
     
     def recursive_split(order_group, depth=0):
         if not order_group:
@@ -520,16 +524,22 @@ def generate_spatial_bundles(orders, max_bundle_size=2):
     
     recursive_split(orders)
     
+    def add_bundle_if_new(bundle):
+        """Add bundle only if not already seen (O(1) lookup)."""
+        sig = frozenset(o.order_id for o in bundle)
+        if sig not in seen_bundle_ids:
+            seen_bundle_ids.add(sig)
+            bundles.append(bundle)
+    
     # Also add nearby pairs explicitly (within MAX_PICKUP_DISTANCE_KM = 5.0 km)
     for i, o1 in enumerate(orders):
         for j, o2 in enumerate(orders):
             if i < j and distances[(o1.order_id, o2.order_id)] <= 5.0:
-                bundles.append([o1, o2])  # (deduplicated)
+                add_bundle_if_new([o1, o2])
     
     # Ensure all single orders are included
     for order in orders:
-        if [order] not in bundles:
-            bundles.append([order])
+        add_bundle_if_new([order])
     
     return bundles
 ```
@@ -588,15 +598,25 @@ Generated Bundles:
 ```python
 def run_combinatorial(self, drivers, orders, current_time):
     """Combinatorial dispatch using spatial clustering for bundle generation."""
+    # Clear TSP cache at start of dispatch cycle (fresh state)
+    _clear_tsp_cache()
+    
     assigned_orders = []
     pending = list(orders)
     
     # Build eligible driver list (IDLE + ACCRUING with capacity)
     eligible_drivers = [...]
     
+    # Build distance matrix ONCE for all pending orders (optimization)
+    all_order_distances = _build_distance_matrix(pending) if pending else {}
+    
     while eligible_drivers and pending:
-        # Generate bundles using spatial clustering
-        candidate_bundles = generate_spatial_bundles(pending, max_bundle_size=2)
+        # Generate bundles using spatial clustering (pass prebuilt distances)
+        candidate_bundles = generate_spatial_bundles(
+            pending, 
+            max_bundle_size=2,
+            prebuilt_distances=all_order_distances
+        )
         
         # Collect all (cost, driver, bundle, new_orders, marginal_dist) tuples
         all_bids = []
@@ -681,7 +701,7 @@ best = min(all_bids, key=lambda x: (x[0], -len(x[3])))
 | **Re-routing** | ✅ Yes - during ACCRUING state |
 | **Decision Speed** | Slower - batch processing |
 | **Optimality** | Best - global optimization over bundles |
-| **Complexity** | O(n log n) bundles × O(m) drivers × O(k!) routing |
+| **Complexity** | O(n log n) bundles × O(m) drivers × O(k²·2^k) routing (Held-Karp) |
 
 ---
 
@@ -901,67 +921,123 @@ Given a driver's current location and a set of orders, find the shortest route t
 
 This is the **Traveling Salesperson Problem with Precedence Constraints (TSP-PC)**.
 
-### Solution: Exhaustive Search with Pruning
+### Solution: Held-Karp Dynamic Programming
+
+We use the **Held-Karp algorithm** - a dynamic programming approach that solves TSP optimally in O(n² × 2ⁿ) time, much faster than brute-force O(n!) for larger bundles:
+
+| Stops | Brute Force O(n!) | Held-Karp O(n²·2ⁿ) | Speedup |
+|-------|-------------------|---------------------|---------|
+| 4 | 24 | 256 | 0.09x |
+| 6 | 720 | 2,304 | 0.31x |
+| 8 | 40,320 | 16,384 | **2.5x** |
+| 10 | 3,628,800 | 102,400 | **35x** |
 
 ```python
 def find_optimal_route(
     start_loc: Tuple[float, float], 
     orders: List[Order], 
-    already_picked_up: List[Order] = None
+    already_picked_up: List[Order] = None,
+    use_cache: bool = True
 ) -> Tuple[List[Stop], float]:
     """
-    Find the shortest valid route through all stops.
+    Find the shortest valid route using Held-Karp DP.
     
-    Complexity: O(n!) where n = 2 * num_orders (but pruned by constraints)
-    Practical for n ≤ 4 orders (8 stops = 40,320 permutations max)
+    Algorithm:
+    - State: dp[visited_mask][last_node] = minimum distance to reach this state
+    - Transitions: Try extending from each state to unvisited nodes
+    - Precedence: Only allow visiting a dropoff if its pickup is already in mask
+    
+    Caching:
+    - Results cached by (rounded_start_loc, order_ids, already_picked_up_ids)
+    - Cache cleared at start of each dispatch cycle via _clear_tsp_cache()
     """
     if not orders:
         return [], 0.0
     
-    already_picked_up_ids = {o.order_id for o in (already_picked_up or [])}
+    # Check cache first
+    if use_cache:
+        cache_key = (round_loc(start_loc), frozenset(order_ids), frozenset(picked_up_ids))
+        if cache_key in _tsp_cache:
+            return _tsp_cache[cache_key]
     
     # Create all required stops
     all_stops = []
+    pickup_idx = {}  # order_id -> index of its pickup stop
+    
     for order in orders:
         if order.order_id not in already_picked_up_ids:
+            pickup_idx[order.order_id] = len(all_stops)
             all_stops.append(Stop(order.pickup_loc, 'PICKUP', order.order_id))
         all_stops.append(Stop(order.dropoff_loc, 'DROPOFF', order.order_id))
     
-    # Generate all permutations
-    best_route = []
-    min_distance = float('inf')
+    n = len(all_stops)
     
-    for perm in permutations(all_stops):
-        # Validate precedence constraint
-        if not is_valid_precedence(perm, already_picked_up_ids):
-            continue
-        
-        # Calculate total distance
-        locations = [start_loc] + [stop.location for stop in perm]
-        distance = sum(
-            get_distance(locations[i], locations[i+1]) 
-            for i in range(len(locations) - 1)
-        )
-        
-        if distance < min_distance:
-            min_distance = distance
-            best_route = list(perm)
+    # Precompute all distances
+    dist_from_start = [get_distance(start_loc, stop.location) for stop in all_stops]
+    dist = [[get_distance(s1.location, s2.location) for s2 in all_stops] for s1 in all_stops]
     
-    return best_route, min_distance
-
-
-def is_valid_precedence(perm, already_picked_up_ids):
-    """Check that each pickup comes before its dropoff."""
-    picked_up = set(already_picked_up_ids)
+    # Precompute which stops require a prior pickup
+    required_pickup = []  # -1 = no prerequisite
+    for i, stop in enumerate(all_stops):
+        if stop.stop_type == 'PICKUP' or stop.order_id in already_picked_up_ids:
+            required_pickup.append(-1)
+        else:
+            required_pickup.append(pickup_idx[stop.order_id])
     
-    for stop in perm:
-        if stop.stop_type == 'PICKUP':
-            picked_up.add(stop.order_id)
-        elif stop.stop_type == 'DROPOFF':
-            if stop.order_id not in picked_up:
-                return False  # Dropoff before pickup!
+    # HELD-KARP DP
+    # dp[mask][i] = min distance to visit all nodes in mask, ending at node i
+    INF = float('inf')
+    full_mask = (1 << n) - 1
+    dp = [[INF] * n for _ in range(1 << n)]
+    parent = [[-1] * n for _ in range(1 << n)]
     
-    return True
+    # Base case: visit first node directly from start (if no prerequisite)
+    for i in range(n):
+        if required_pickup[i] == -1:
+            dp[1 << i][i] = dist_from_start[i]
+    
+    # Fill DP table
+    for mask in range(1, 1 << n):
+        for last in range(n):
+            if dp[mask][last] == INF or not (mask & (1 << last)):
+                continue
+            
+            for nxt in range(n):
+                if mask & (1 << nxt):  # Already visited
+                    continue
+                
+                # Check precedence constraint
+                req = required_pickup[nxt]
+                if req != -1 and not (mask & (1 << req)):
+                    continue  # Pickup not yet done
+                
+                new_mask = mask | (1 << nxt)
+                new_dist = dp[mask][last] + dist[last][nxt]
+                
+                if new_dist < dp[new_mask][nxt]:
+                    dp[new_mask][nxt] = new_dist
+                    parent[new_mask][nxt] = last
+    
+    # Find best ending state
+    best_dist, best_last = min((dp[full_mask][i], i) for i in range(n))
+    
+    # Reconstruct path via parent pointers
+    path = []
+    mask, curr = full_mask, best_last
+    while curr != -1:
+        path.append(curr)
+        prev = parent[mask][curr]
+        mask ^= (1 << curr)
+        curr = prev
+    path.reverse()
+    
+    best_route = [all_stops[i] for i in path]
+    
+    # Cache result
+    if use_cache:
+        _tsp_cache[cache_key] = (best_route, best_dist)
+    
+    return best_route, best_dist
 ```
 
 ### Example
@@ -1177,6 +1253,55 @@ This ensures all orders get assigned even in edge cases.
 
 ---
 
-**Document Version**: 2.0  
-**Last Updated**: January 17, 2026  
+## Appendix D: Performance Optimizations
+
+Several optimizations make the algorithms practical for real-time dispatch:
+
+### 1. TSP Caching
+
+Route calculations are cached within each dispatch cycle:
+
+```python
+_tsp_cache: Dict[CacheKey, Tuple[List[Stop], float]] = {}
+
+# Cache key: (rounded_start_loc, frozenset_of_order_ids, frozenset_of_picked_up_ids)
+# Cleared at start of each dispatch cycle to avoid stale data
+```
+
+### 2. O(1) Bundle Deduplication
+
+Bundle generation uses frozensets for constant-time duplicate detection:
+
+```python
+seen_bundle_ids: Set[FrozenSet[str]] = set()
+
+def add_bundle_if_new(bundle):
+    sig = frozenset(o.order_id for o in bundle)
+    if sig not in seen_bundle_ids:  # O(1) lookup
+        seen_bundle_ids.add(sig)
+        bundles.append(bundle)
+```
+
+### 3. Prebuilt Distance Matrix
+
+The distance matrix is built once per dispatch cycle, not per bundle:
+
+```python
+# In run_combinatorial():
+all_order_distances = _build_distance_matrix(pending)  # Build once
+
+# Passed to generate_spatial_bundles() to avoid rebuilding
+candidate_bundles = generate_spatial_bundles(
+    pending, prebuilt_distances=all_order_distances
+)
+```
+
+### 4. Held-Karp vs Brute-Force
+
+The Held-Karp DP algorithm provides significant speedups for larger bundles while maintaining optimal solutions. See Section 9 for complexity analysis.
+
+---
+
+**Document Version**: 2.1  
+**Last Updated**: January 24, 2026  
 **For**: Snoonu Hackathon 2026 - Case 1: Operations & Logistics at Scale

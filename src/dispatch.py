@@ -21,11 +21,33 @@ Four dispatch strategies are available:
 from __future__ import annotations
 
 from itertools import permutations, combinations
-from typing import List, Tuple, Optional, Set, Dict
+from typing import List, Tuple, Optional, Set, Dict, FrozenSet
+from functools import lru_cache
 import random
 
 from . import utils, scoring, config
 from .models import Driver, Order, Bundle, DriverStatus, OrderStatus, Stop
+
+
+# =============================================================================
+# CACHING FOR TSP ROUTES
+# =============================================================================
+# Cache for TSP route calculations within a single dispatch cycle.
+# Key: (rounded_start_loc, frozenset_of_order_ids, frozenset_of_already_picked_up_ids)
+# Cleared at the start of each dispatch call to avoid stale data.
+
+_tsp_cache: Dict[Tuple[Tuple[float, float], FrozenSet[str], FrozenSet[str]], Tuple[List[Stop], float]] = {}
+
+
+def _clear_tsp_cache() -> None:
+    """Clear the TSP route cache. Call at start of each dispatch cycle."""
+    global _tsp_cache
+    _tsp_cache.clear()
+
+
+def _round_loc(loc: Tuple[float, float], precision: int = 4) -> Tuple[float, float]:
+    """Round location to reduce cache misses from floating point differences."""
+    return (round(loc[0], precision), round(loc[1], precision))
 
 
 def _build_distance_matrix(orders: List[Order]) -> Dict[Tuple[str, str], float]:
@@ -89,7 +111,8 @@ def _greedy_max_cut(
 
 def generate_spatial_bundles(
     orders: List[Order],
-    max_bundle_size: int = None
+    max_bundle_size: int = None,
+    prebuilt_distances: Optional[Dict[Tuple[str, str], float]] = None
 ) -> List[List[Order]]:
     """
     Generate bundles using recursive graph-cut spatial clustering.
@@ -110,6 +133,7 @@ def generate_spatial_bundles(
     Args:
         orders: List of orders to bundle
         max_bundle_size: Maximum bundle size to generate (default from config)
+        prebuilt_distances: Optional pre-computed distance matrix (optimization)
         
     Returns:
         List of order bundles (each bundle is a list of orders)
@@ -120,11 +144,24 @@ def generate_spatial_bundles(
     if not orders:
         return []
     
-    # Build distance matrix once
-    distances = _build_distance_matrix(orders)
+    # Use prebuilt distance matrix or build one
+    if prebuilt_distances is not None:
+        distances = prebuilt_distances
+    else:
+        distances = _build_distance_matrix(orders)
     
     # Generate bundles recursively
     bundles: List[List[Order]] = []
+    
+    # Track seen bundle signatures for O(1) duplicate detection
+    seen_bundle_ids: Set[FrozenSet[str]] = set()
+    
+    def add_bundle_if_new(bundle: List[Order]) -> None:
+        """Add bundle only if not already seen."""
+        bundle_sig = frozenset(o.order_id for o in bundle)
+        if bundle_sig not in seen_bundle_ids:
+            seen_bundle_ids.add(bundle_sig)
+            bundles.append(bundle)
     
     def recursive_split(order_group: List[Order], depth: int = 0):
         """Recursively split and generate bundles."""
@@ -133,21 +170,21 @@ def generate_spatial_bundles(
         
         # Always add individual orders as bundles (size 1)
         if len(order_group) == 1:
-            bundles.append(order_group)
+            add_bundle_if_new(order_group)
             return
         
         # Add current group if within size limit
         if len(order_group) <= max_bundle_size:
-            bundles.append(order_group)
+            add_bundle_if_new(order_group)
         
         # Split into two groups using max-cut
         group_a, group_b = _greedy_max_cut(order_group, distances)
         
         # Add the split groups if within size limit
         if 1 < len(group_a) <= max_bundle_size:
-            bundles.append(group_a)
+            add_bundle_if_new(group_a)
         if 1 < len(group_b) <= max_bundle_size:
-            bundles.append(group_b)
+            add_bundle_if_new(group_b)
         
         # Recurse on larger groups (but limit depth to avoid explosion)
         if depth < 5:  # Max recursion depth
@@ -161,25 +198,17 @@ def generate_spatial_bundles(
     
     # Also add pairs of nearby orders (important for small bundles)
     # This ensures we don't miss good 2-order bundles
+    # Now uses O(1) duplicate detection via seen_bundle_ids
     for i, o1 in enumerate(orders):
         for j, o2 in enumerate(orders):
             if i < j:
                 dist = distances.get((o1.order_id, o2.order_id), float('inf'))
                 if dist <= config.MAX_PICKUP_DISTANCE_KM:
-                    pair = [o1, o2]
-                    # Avoid duplicates
-                    pair_ids = {o1.order_id, o2.order_id}
-                    if not any(
-                        {o.order_id for o in b} == pair_ids 
-                        for b in bundles if len(b) == 2
-                    ):
-                        bundles.append(pair)
+                    add_bundle_if_new([o1, o2])
     
-    # Add all single orders if not already present
-    single_ids = {b[0].order_id for b in bundles if len(b) == 1}
+    # Add all single orders if not already present (using O(1) lookup)
     for order in orders:
-        if order.order_id not in single_ids:
-            bundles.append([order])
+        add_bundle_if_new([order])
     
     return bundles
 
@@ -187,7 +216,8 @@ def generate_spatial_bundles(
 def find_optimal_route(
     start_loc: Tuple[float, float], 
     orders: List[Order], 
-    already_picked_up: Optional[List[Order]] = None
+    already_picked_up: Optional[List[Order]] = None,
+    use_cache: bool = True
 ) -> Tuple[List[Stop], float]:
     """
     Find the shortest route for a driver to complete a set of orders.
@@ -195,22 +225,33 @@ def find_optimal_route(
     This solves the Traveling Salesperson Problem with Precedence Constraints (TSP-PC).
     For each order, pickup must occur before dropoff.
     
-    Algorithm:
-    - Generate all permutations of stops
-    - Filter to those respecting pickup-before-dropoff constraints
-    - Return the permutation with minimum total distance
+    Algorithm: Held-Karp Dynamic Programming
+    - State: dp[visited_mask][last_node] = minimum distance
+    - Handles precedence constraints by checking if pickup visited before dropoff
+    - Complexity: O(n² * 2^n) where n = number of stops
     
-    Complexity: O(n! * n) where n = 2 * num_orders (but pruned by constraints)
+    This is MUCH faster than brute-force O(n!) for larger bundles:
+    - 4 stops: 256 vs 24 operations
+    - 6 stops: 2,304 vs 720 operations  
+    - 8 stops: 16,384 vs 40,320 operations (2.5x faster)
+    - 10 stops: 102,400 vs 3,628,800 operations (35x faster)
+    
+    Caching:
+    - Results are cached by (rounded_start_loc, order_ids, already_picked_up_ids)
+    - Cache is cleared at the start of each dispatch cycle via _clear_tsp_cache()
     
     Args:
         start_loc: Driver's current (lat, lng) position
         orders: All orders to be delivered
         already_picked_up: Orders already in vehicle (skip pickup stop)
+        use_cache: Whether to use TSP cache (default True)
         
     Returns:
         Tuple of (optimal_stop_sequence, total_distance_km)
         Returns ([], 0.0) if no orders provided
     """
+    global _tsp_cache
+    
     if not orders:
         return [], 0.0
     
@@ -218,12 +259,24 @@ def find_optimal_route(
         already_picked_up = []
     
     already_picked_up_ids: Set[str] = {o.order_id for o in already_picked_up}
+    order_ids: FrozenSet[str] = frozenset(o.order_id for o in orders)
+    picked_up_frozen: FrozenSet[str] = frozenset(already_picked_up_ids)
+    
+    # Check cache
+    if use_cache:
+        rounded_start = _round_loc(start_loc)
+        cache_key = (rounded_start, order_ids, picked_up_frozen)
+        if cache_key in _tsp_cache:
+            return _tsp_cache[cache_key]
 
-    # Create all required stops for the given orders
+    # Create all required stops and track pickup indices for precedence checking
     all_stops: List[Stop] = []
+    pickup_idx: Dict[str, int] = {}  # order_id -> index of its pickup stop
+    
     for order in orders:
         # Only add pickup stop if not already in vehicle
         if order.order_id not in already_picked_up_ids:
+            pickup_idx[order.order_id] = len(all_stops)
             all_stops.append(Stop(
                 location=order.pickup_loc, 
                 stop_type='PICKUP', 
@@ -234,45 +287,117 @@ def find_optimal_route(
             stop_type='DROPOFF', 
             order_id=order.order_id
         ))
-
-    # Generate and evaluate all valid permutations
-    all_perms = list(permutations(all_stops))
     
-    best_route_stops: List[Stop] = []
-    min_distance: float = float('inf')
-
-    for perm in all_perms:
-        # Validate precedence constraints: pickup before dropoff
-        is_valid = True
-        picked_up_in_perm: Set[str] = set(already_picked_up_ids)
-        
-        for stop in perm:
-            if stop.stop_type == 'PICKUP':
-                picked_up_in_perm.add(stop.order_id)
-            elif stop.stop_type == 'DROPOFF':
-                if stop.order_id not in picked_up_in_perm:
-                    is_valid = False
-                    break
-        
-        if not is_valid:
-            continue
-
-        # Calculate total distance for this valid permutation
-        route_locations = [start_loc] + [stop.location for stop in perm]
-        
-        current_distance: float = 0.0
-        for i in range(len(route_locations) - 1):
-            loc1 = route_locations[i]
-            loc2 = route_locations[i + 1]
-            current_distance += utils.get_distance(
-                loc1[0], loc1[1], loc2[0], loc2[1]
+    n = len(all_stops)
+    if n == 0:
+        return [], 0.0
+    
+    # Precompute all distances (avoid repeated get_distance calls)
+    dist_from_start: List[float] = []
+    for stop in all_stops:
+        dist_from_start.append(utils.get_distance(
+            start_loc[0], start_loc[1],
+            stop.location[0], stop.location[1]
+        ))
+    
+    dist: List[List[float]] = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = utils.get_distance(
+                all_stops[i].location[0], all_stops[i].location[1],
+                all_stops[j].location[0], all_stops[j].location[1]
             )
-
-        if current_distance < min_distance:
-            min_distance = current_distance
-            best_route_stops = list(perm)
-
-    return best_route_stops, min_distance
+            dist[i][j] = d
+            dist[j][i] = d
+    
+    # Precompute which stops are dropoffs and their required pickup indices
+    # -1 means no pickup required (either it's a pickup, or already picked up)
+    required_pickup: List[int] = []
+    for i, stop in enumerate(all_stops):
+        if stop.stop_type == 'PICKUP':
+            required_pickup.append(-1)  # Pickups have no prerequisite
+        else:
+            # Dropoff: need to check if pickup was visited
+            order_id = stop.order_id
+            if order_id in already_picked_up_ids:
+                required_pickup.append(-1)  # Already picked up, no constraint
+            else:
+                required_pickup.append(pickup_idx[order_id])
+    
+    # ============================================================
+    # HELD-KARP DYNAMIC PROGRAMMING
+    # ============================================================
+    # dp[mask][i] = minimum distance to visit all stops in 'mask', ending at stop i
+    # mask is a bitmask where bit j is set if stop j has been visited
+    
+    INF = float('inf')
+    full_mask = (1 << n) - 1
+    
+    # Initialize DP table
+    dp: List[List[float]] = [[INF] * n for _ in range(1 << n)]
+    parent: List[List[int]] = [[-1] * n for _ in range(1 << n)]
+    
+    # Base case: visit first stop directly from start
+    for i in range(n):
+        req = required_pickup[i]
+        if req == -1:  # Can visit this stop first (no prerequisite)
+            dp[1 << i][i] = dist_from_start[i]
+    
+    # Fill DP table in order of increasing mask size
+    for mask in range(1, 1 << n):
+        for last in range(n):
+            if dp[mask][last] == INF:
+                continue
+            if not (mask & (1 << last)):
+                continue  # 'last' must be in mask
+            
+            # Try extending to each unvisited stop
+            for nxt in range(n):
+                if mask & (1 << nxt):
+                    continue  # Already visited
+                
+                # Check precedence constraint
+                req = required_pickup[nxt]
+                if req != -1 and not (mask & (1 << req)):
+                    continue  # Pickup not yet visited, can't do this dropoff
+                
+                new_mask = mask | (1 << nxt)
+                new_dist = dp[mask][last] + dist[last][nxt]
+                
+                if new_dist < dp[new_mask][nxt]:
+                    dp[new_mask][nxt] = new_dist
+                    parent[new_mask][nxt] = last
+    
+    # Find the best final state (all stops visited)
+    best_dist = INF
+    best_last = -1
+    for i in range(n):
+        if dp[full_mask][i] < best_dist:
+            best_dist = dp[full_mask][i]
+            best_last = i
+    
+    if best_last == -1 or best_dist == INF:
+        return [], 0.0
+    
+    # Reconstruct the optimal path by following parent pointers
+    path_indices: List[int] = []
+    mask = full_mask
+    curr = best_last
+    
+    while curr != -1:
+        path_indices.append(curr)
+        prev = parent[mask][curr]
+        mask = mask ^ (1 << curr)  # Remove curr from mask
+        curr = prev
+    
+    path_indices.reverse()
+    best_route_stops = [all_stops[i] for i in path_indices]
+    
+    # Cache the result
+    if use_cache:
+        _tsp_cache[cache_key] = (best_route_stops, best_dist)
+    
+    return best_route_stops, best_dist
 
 
 class DispatchEngine:
@@ -438,6 +563,9 @@ class DispatchEngine:
         Returns:
             Tuple of (assigned_orders, total_marginal_distance_km)
         """
+        # Clear TSP cache at start of dispatch cycle (fresh state)
+        _clear_tsp_cache()
+        
         assigned_orders: List[Order] = []
         total_distance_in_tick: float = 0.0
         
@@ -587,6 +715,9 @@ class DispatchEngine:
         Returns:
             Tuple of (assigned_orders, total_marginal_distance_km)
         """
+        # Clear TSP cache at start of dispatch cycle (fresh state)
+        _clear_tsp_cache()
+        
         assigned_orders_in_cycle: List[Order] = []
         total_distance_in_tick: float = 0.0
         
@@ -613,12 +744,16 @@ class DispatchEngine:
                     eligible_drivers.append(d)
         
         pending_orders = list(orders)
+        
+        # Build distance matrix ONCE for all pending orders (optimization)
+        all_order_distances = _build_distance_matrix(pending_orders) if pending_orders else {}
 
         while eligible_drivers and pending_orders:
-            # Generate bundles using spatial clustering
+            # Generate bundles using spatial clustering (pass prebuilt distances)
             candidate_bundles = generate_spatial_bundles(
                 pending_orders, 
-                max_bundle_size=config.MAX_BUNDLE_SIZE
+                max_bundle_size=config.MAX_BUNDLE_SIZE,
+                prebuilt_distances=all_order_distances
             )
             
             # Collect all possible (cost, driver, bundle, new_orders, marginal_dist) tuples
